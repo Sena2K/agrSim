@@ -1,14 +1,25 @@
+# Makefile
+
 CC = gcc
-CFLAGS = -Wall -g `pkg-config fuse3 --cflags`
-LDFLAGS = `pkg-config fuse3 --libs`
+CFLAGS = -Wall -Wextra -O2 `pkg-config fuse3 --cflags`
+LIBS = `pkg-config fuse3 --libs`
 
-TARGET = bmpfs
-SRC = bmpfs.c
+OBJ = main.o bmpfs.o bmp.o
 
-all: $(TARGET)
+all: bmpfs
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
+bmpfs: $(OBJ)
+	$(CC) $(CFLAGS) -o bmpfs $(OBJ) $(LIBS)
+
+main.o: main.c bmpfs.h
+	$(CC) $(CFLAGS) -c main.c
+
+bmpfs.o: bmpfs.c bmpfs.h bmp.h
+	$(CC) $(CFLAGS) -c bmpfs.c
+
+bmp.o: bmp.c bmp.h
+	$(CC) $(CFLAGS) -c bmp.c
 
 clean:
-	rm -f $(TARGET) *.o
+	rm -f *.o bmpfs
+
