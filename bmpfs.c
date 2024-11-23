@@ -28,11 +28,12 @@ typedef struct {
     uint32_t mode;
     uint32_t uid;
     uint32_t gid;
+    uint8_t is_dir; // 1 para diretório, 0 para arquivo
 } FileMetadata;
 #pragma pack(pop)
 
 // Verificação estática do tamanho da estrutura
-_Static_assert(sizeof(FileMetadata) == 308, "FileMetadata size must be 308 bytes");
+_Static_assert(sizeof(FileMetadata) == 309, "FileMetadata size must be 309 bytes");
 
 // BMP file header structure (14 bytes)
 #pragma pack(push, 1)
@@ -341,7 +342,7 @@ static int validate_path(const char *path) {
         path++;
     }
 
-    // Check for invalid characters (no slashes allowed)
+    // Check for invalid characters (no slashes allowed for este exemplo)
     if (strchr(path, '/')) {
         return -EINVAL;
     }
@@ -446,7 +447,68 @@ static int write_blocks(uint32_t start_block, size_t num_blocks, const char *buf
     return 0;
 }
 
-// FUSE operations with improved error handling and security
+// Função para criar diretórios
+static int bmpfs_mkdir(const char *path, mode_t mode) {
+    debug_log("Creating directory: %s\n", path);
+
+    int validation = validate_path(path);
+    if (validation < 0) {
+        debug_log("Path validation failed: %d\n", validation);
+        return validation;
+    }
+
+    // Verificar se o diretório já existe
+    if (path_to_metadata_index(path) >= 0) {
+        debug_log("Directory already exists\n");
+        return -EEXIST;
+    }
+
+    // Encontrar um slot de metadados vazio
+    int idx = -1;
+    for (size_t i = 0; i < fs_state.max_files; i++) {
+        if (fs_state.files[i].filename[0] == '\0') {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx < 0) {
+        debug_log("No free metadata slots\n");
+        return -ENOMEM;
+    }
+
+    // Inicializar metadados
+    FileMetadata *meta = &fs_state.files[idx];
+    const char *dirname = path;
+    if (path[0] == '/') {
+        dirname++;
+    }
+
+    strncpy(meta->filename, dirname, sizeof(meta->filename) - 1);
+    meta->filename[sizeof(meta->filename) - 1] = '\0';
+    meta->size = 0;
+    meta->created = time(NULL);
+    meta->modified = meta->created;
+    meta->accessed = meta->created;
+    meta->first_block = UINT32_MAX; // Nenhum bloco alocado ainda
+    meta->num_blocks = 0;
+    meta->mode = S_IFDIR | (mode & 0777); // Definir como diretório
+    meta->uid = getuid();
+    meta->gid = getgid();
+    meta->is_dir = 1;
+
+    debug_log("Directory created successfully: %s (idx: %d)\n", path, idx);
+
+    // Escrever metadados atualizados no arquivo BMP
+    if (write_metadata(&fs_state) < 0) {
+        debug_log("Failed to write metadata after directory creation\n");
+        return -EIO;
+    }
+
+    return 0;
+}
+
+// FUSE operations com suporte a diretórios
 static int bmpfs_getattr(const char *path, struct stat *stbuf,
                          struct fuse_file_info *fi) {
     memset(stbuf, 0, sizeof(struct stat));
@@ -469,14 +531,14 @@ static int bmpfs_getattr(const char *path, struct stat *stbuf,
 
     FileMetadata *meta = &fs_state.files[idx];
     stbuf->st_mode = meta->mode;
-    stbuf->st_nlink = 1;
+    stbuf->st_nlink = meta->is_dir ? 2 : 1; // Diretórios têm pelo menos 2 links
     stbuf->st_size = meta->size;
     stbuf->st_uid = meta->uid;
     stbuf->st_gid = meta->gid;
     stbuf->st_atime = meta->accessed;
     stbuf->st_mtime = meta->modified;
     stbuf->st_ctime = meta->created;
-    stbuf->st_blocks = (meta->size + 511) / 512; // Standard block size
+    stbuf->st_blocks = (meta->size + 511) / 512; // Tamanho padrão do bloco
     stbuf->st_blksize = fs_state.block_size;
 
     return 0;
@@ -492,13 +554,13 @@ static int bmpfs_create(const char *path, mode_t mode,
         return validation;
     }
 
-    // Check se o arquivo já existe
+    // Check if the file already exists
     if (path_to_metadata_index(path) >= 0) {
         debug_log("File already exists\n");
         return -EEXIST;
     }
 
-    // Encontrar um slot de metadados vazio
+    // Find an empty metadata slot
     int idx = -1;
     for (size_t i = 0; i < fs_state.max_files; i++) {
         if (fs_state.files[i].filename[0] == '\0') {
@@ -512,7 +574,7 @@ static int bmpfs_create(const char *path, mode_t mode,
         return -ENOMEM;
     }
 
-    // Inicializar metadados
+    // Initialize metadata
     FileMetadata *meta = &fs_state.files[idx];
     const char *filename = path;
     if (path[0] == '/') {
@@ -525,15 +587,16 @@ static int bmpfs_create(const char *path, mode_t mode,
     meta->created = time(NULL);
     meta->modified = meta->created;
     meta->accessed = meta->created;
-    meta->first_block = UINT32_MAX; // Nenhum bloco alocado ainda
+    meta->first_block = UINT32_MAX; // No blocks allocated yet
     meta->num_blocks = 0;
     meta->mode = S_IFREG | (mode & 0777);
     meta->uid = getuid();
     meta->gid = getgid();
+    meta->is_dir = 0;
 
     debug_log("File created successfully: %s (idx: %d)\n", path, idx);
 
-    // Escrever metadados atualizados no arquivo BMP
+    // Write updated metadata to the BMP file
     if (write_metadata(&fs_state) < 0) {
         debug_log("Failed to write metadata after file creation\n");
         return -EIO;
@@ -595,7 +658,7 @@ static void *bmpfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         return NULL;
     }
 
-    // Ler cabeçalhos BMP
+    // Read BMP headers
     BMPHeader header;
     BMPInfoHeader info_header;
 
@@ -605,7 +668,7 @@ static void *bmpfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         return NULL;
     }
 
-    if (header.signature != 0x4D42) { // "BM" em little endian
+    if (header.signature != 0x4D42) { // "BM" in little endian
         debug_log("Invalid BMP signature\n");
         fclose(fs_state.bmp_file);
         return NULL;
@@ -620,7 +683,7 @@ static void *bmpfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     fs_state.header = header;
     fs_state.info_header = info_header;
 
-    // Calcular tamanho da linha com padding
+    // Calculate row size with padding
     size_t row_size = (info_header.width * 3 + 3) & ~3;
     fs_state.data_size = row_size * info_header.height;
     fs_state.block_size = 512;
@@ -647,7 +710,7 @@ static void *bmpfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         return NULL;
     }
 
-    // Ler metadados existentes
+    // Read existing metadata
     if (read_metadata(&fs_state) < 0) {
         debug_log("Failed to read metadata\n");
         free(fs_state.bitmap);
@@ -661,18 +724,18 @@ static void *bmpfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
 }
 
 static void bmpfs_destroy(void *private_data) {
-    // Escrever metadados no arquivo BMP
+    // Write metadata to the BMP file
     if (write_metadata(&fs_state) < 0) {
         debug_log("Failed to write metadata on destroy\n");
     }
 
-    // Fechar o arquivo BMP se estiver aberto
+    // Close the BMP file if it's open
     if (fs_state.bmp_file) {
         fclose(fs_state.bmp_file);
         fs_state.bmp_file = NULL;
     }
 
-    // Liberar memória alocada para bitmap, arquivos e caminho da imagem
+    // Free allocated memory for bitmap, files, and image path
     free(fs_state.bitmap);
     fs_state.bitmap = NULL;
     free(fs_state.files);
@@ -689,15 +752,21 @@ static int bmpfs_unlink(const char *path) {
 
     FileMetadata *meta = &fs_state.files[idx];
 
+    // Verificar se é um diretório
+    if (meta->is_dir) {
+        debug_log("Cannot unlink a directory: %s\n", path);
+        return -EISDIR;
+    }
+
     // Liberar blocos no bitmap
     for (uint32_t i = 0; i < meta->num_blocks; i++) {
         fs_state.bitmap[meta->first_block + i] = 0;
     }
 
-    // Limpar metadados
+    // Clear metadata
     memset(meta, 0, sizeof(FileMetadata));
 
-    // Escrever metadados atualizados no arquivo BMP
+    // Write updated metadata to the BMP file
     if (write_metadata(&fs_state) < 0) {
         debug_log("Failed to write metadata after file deletion\n");
         return -EIO;
@@ -720,25 +789,30 @@ static int bmpfs_read(const char *path, char *buf, size_t size, off_t offset,
 
     FileMetadata *meta = &fs_state.files[idx];
 
-    // Atualizar tempo de acesso
+    // Não é possível ler diretórios
+    if (meta->is_dir) {
+        return -EISDIR;
+    }
+
+    // Update access time
     meta->accessed = time(NULL);
 
     if (offset >= meta->size) {
         return 0;
     }
 
-    // Ajustar tamanho se estiver lendo além do final do arquivo
+    // Adjust size if reading beyond end of file
     if (offset + size > meta->size) {
         size = meta->size - offset;
     }
 
-    // Calcular posição do bloco
+    // Calculate block position
     uint32_t start_block = meta->first_block + (offset / fs_state.block_size);
     size_t block_offset = offset % fs_state.block_size;
     size_t blocks_to_read =
         (size + block_offset + fs_state.block_size - 1) / fs_state.block_size;
 
-    // Alocar buffer temporário para leitura alinhada
+    // Allocate temporary buffer for aligned reading
     char *temp_buf = malloc(blocks_to_read * fs_state.block_size);
     if (!temp_buf) {
         return -ENOMEM;
@@ -773,20 +847,27 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
     }
 
     FileMetadata *meta = &fs_state.files[idx];
+    
+    // Não é possível escrever em diretórios
+    if (meta->is_dir) {
+        debug_log("Cannot write to a directory: %s\n", path);
+        return -EISDIR;
+    }
+
     size_t new_size = offset + size;
 
-    // Verificar overflow
+    // Check for overflow
     if (new_size < offset) {
         debug_log("File size overflow\n");
         return -EFBIG;
     }
 
-    // Calcular blocos necessários
+    // Calculate required blocks
     size_t new_blocks =
         (new_size + fs_state.block_size - 1) / fs_state.block_size;
     debug_log("Required blocks: %zu (current: %u)\n", new_blocks, meta->num_blocks);
 
-    // Se precisar de mais blocos
+    // If more blocks are needed
     if (new_blocks > meta->num_blocks) {
         uint32_t new_start = find_free_blocks(new_blocks);
         if (new_start == UINT32_MAX) {
@@ -796,7 +877,7 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
 
         debug_log("Allocated new blocks starting at: %u\n", new_start);
 
-        // Se já tiver blocos, copiar dados existentes
+        // If blocks already allocated, copy existing data
         if (meta->num_blocks > 0) {
             char *temp_buf = malloc(meta->num_blocks * fs_state.block_size);
             if (!temp_buf) {
@@ -820,13 +901,13 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
                 return write_result;
             }
 
-            // Liberar blocos antigos no bitmap
+            // Free old blocks in bitmap
             for (uint32_t i = 0; i < meta->num_blocks; i++) {
                 fs_state.bitmap[meta->first_block + i] = 0;
             }
         }
 
-        // Atualizar metadados e marcar novos blocos como usados
+        // Update metadata and mark new blocks as used
         meta->first_block = new_start;
         for (uint32_t i = 0; i < new_blocks; i++) {
             fs_state.bitmap[new_start + i] = 1;
@@ -834,7 +915,7 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
         meta->num_blocks = new_blocks;
     }
 
-    // Realizar a escrita real
+    // Perform the actual write
     uint32_t start_block = meta->first_block + (offset / fs_state.block_size);
     size_t block_offset = offset % fs_state.block_size;
     size_t blocks_to_write =
@@ -846,7 +927,7 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
         return -ENOMEM;
     }
 
-    // Se não estiver escrevendo um bloco completo, ler dados existentes primeiro
+    // If not writing a full block, read existing data first
     if (block_offset > 0 || (size % fs_state.block_size) != 0) {
         int read_result = read_blocks(start_block, blocks_to_write, temp_buf);
         if (read_result < 0) {
@@ -855,14 +936,14 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
             return read_result;
         }
     } else {
-        // Preencher buffer com zeros se for escrever blocos completos
+        // Fill buffer with zeros if writing full blocks
         memset(temp_buf, 0, blocks_to_write * fs_state.block_size);
     }
 
-    // Copiar novos dados para o buffer
+    // Copy new data into the buffer
     memcpy(temp_buf + block_offset, buf, size);
 
-    // Escrever os dados
+    // Write the data
     int write_result = write_blocks(start_block, blocks_to_write, temp_buf);
     free(temp_buf);
 
@@ -871,7 +952,7 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
         return write_result;
     }
 
-    // Atualizar tamanho do arquivo se necessário
+    // Update file size if necessary
     if (new_size > meta->size) {
         meta->size = new_size;
     }
@@ -879,7 +960,7 @@ static int bmpfs_write(const char *path, const char *buf, size_t size,
 
     debug_log("Write successful: %zu bytes written\n", size);
 
-    // Escrever metadados atualizados no arquivo BMP
+    // Write updated metadata to the BMP file
     if (write_metadata(&fs_state) < 0) {
         debug_log("Failed to write metadata after file write\n");
         return -EIO;
@@ -895,27 +976,32 @@ static int bmpfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         return -ENOENT;
     }
 
-    // Adicionar entradas padrão
+    // Add default entries
     if (filler(buf, ".", NULL, 0, 0) || filler(buf, "..", NULL, 0, 0)) {
         return -ENOMEM;
     }
 
-    // Adicionar todas as entradas de arquivos não vazios
+    // Add all non-empty files and directories
     for (size_t i = 0; i < fs_state.max_files; i++) {
         if (fs_state.files[i].filename[0] != '\0') {
             struct stat st;
             memset(&st, 0, sizeof(struct stat));
             st.st_mode = fs_state.files[i].mode;
-            st.st_nlink = 1; // Arquivos regulares têm pelo menos um link
+            st.st_nlink = fs_state.files[i].is_dir ? 2 : 1;
             st.st_size = fs_state.files[i].size;
             st.st_uid = fs_state.files[i].uid;
             st.st_gid = fs_state.files[i].gid;
             st.st_atime = fs_state.files[i].accessed;
             st.st_mtime = fs_state.files[i].modified;
             st.st_ctime = fs_state.files[i].created;
-            st.st_blocks =
-                (fs_state.files[i].size + 511) / 512; // Número de blocos de 512 bytes
+            st.st_blocks = (fs_state.files[i].size + 511) / 512;
             st.st_blksize = fs_state.block_size;
+
+            if (fs_state.files[i].is_dir) {
+                st.st_mode |= S_IFDIR;
+            } else {
+                st.st_mode |= S_IFREG;
+            }
 
             if (filler(buf, fs_state.files[i].filename, &st, 0, 0)) {
                 return -ENOMEM;
@@ -939,10 +1025,16 @@ static int bmpfs_truncate(const char *path, off_t size,
 
     FileMetadata *meta = &fs_state.files[idx];
 
-    // Calcular novo número de blocos
+    // Não é possível truncar diretórios
+    if (meta->is_dir) {
+        debug_log("Cannot truncate a directory: %s\n", path);
+        return -EISDIR;
+    }
+
+    // Calculate new number of blocks
     size_t new_blocks = (size + fs_state.block_size - 1) / fs_state.block_size;
 
-    // Se truncar para zero, liberar todos os blocos
+    // If truncating to zero, free all blocks
     if (size == 0) {
         for (uint32_t i = 0; i < meta->num_blocks; i++) {
             fs_state.bitmap[meta->first_block + i] = 0;
@@ -952,7 +1044,7 @@ static int bmpfs_truncate(const char *path, off_t size,
         meta->size = 0;
         meta->modified = time(NULL);
     }
-    // Se reduzir
+    // If reducing
     else if (new_blocks < meta->num_blocks) {
         for (uint32_t i = new_blocks; i < meta->num_blocks; i++) {
             fs_state.bitmap[meta->first_block + i] = 0;
@@ -961,14 +1053,14 @@ static int bmpfs_truncate(const char *path, off_t size,
         meta->size = size;
         meta->modified = time(NULL);
     }
-    // Se aumentar
+    // If increasing
     else if (new_blocks > meta->num_blocks) {
         uint32_t new_start = find_free_blocks(new_blocks);
         if (new_start == UINT32_MAX) {
             return -ENOSPC;
         }
 
-        // Copiar dados existentes, se houver
+        // Copy existing data if any
         if (meta->num_blocks > 0) {
             char *temp_buf = malloc(meta->num_blocks * fs_state.block_size);
             if (!temp_buf) {
@@ -993,13 +1085,13 @@ static int bmpfs_truncate(const char *path, off_t size,
                 return write_result;
             }
 
-            // Liberar blocos antigos no bitmap
+            // Free old blocks in bitmap
             for (uint32_t i = 0; i < meta->num_blocks; i++) {
                 fs_state.bitmap[meta->first_block + i] = 0;
             }
         }
 
-        // Marcar novos blocos como usados
+        // Mark new blocks as used
         for (uint32_t i = 0; i < new_blocks; i++) {
             fs_state.bitmap[new_start + i] = 1;
         }
@@ -1010,7 +1102,7 @@ static int bmpfs_truncate(const char *path, off_t size,
         meta->modified = time(NULL);
     }
 
-    // Escrever metadados atualizados no arquivo BMP
+    // Write updated metadata to the BMP file
     if (write_metadata(&fs_state) < 0) {
         debug_log("Failed to write metadata after truncate\n");
         return -EIO;
@@ -1029,7 +1121,7 @@ static int bmpfs_utimens(const char *path, const struct timespec ts[2],
 
     FileMetadata *meta = &fs_state.files[idx];
 
-    // Atualizar tempos de acesso e modificação
+    // Update access and modification times
     if (ts) {
         meta->accessed = ts[0].tv_sec;
         meta->modified = ts[1].tv_sec;
@@ -1057,15 +1149,20 @@ static int bmpfs_fsync(const char *path, int datasync,
 }
 
 static int bmpfs_open(const char *path, struct fuse_file_info *fi) {
-    // Validar o caminho
+    // Validate the path
     int idx = path_to_metadata_index(path);
     if (idx < 0) {
-        return idx; // Retornar código de erro (ex: -ENOENT)
+        return idx; // Return error code (e.g., -ENOENT)
     }
 
     FileMetadata *meta = &fs_state.files[idx];
 
-    // Verificar permissões de leitura/escrita conforme o modo
+    // Não é possível abrir diretórios para escrita
+    if (meta->is_dir && (fi->flags & O_WRONLY)) {
+        return -EACCES;
+    }
+
+    // Check read/write permissions based on mode
     if ((fi->flags & O_WRONLY) && !(meta->mode & S_IWUSR)) {
         return -EACCES; // Sem permissão de escrita
     }
@@ -1073,13 +1170,57 @@ static int bmpfs_open(const char *path, struct fuse_file_info *fi) {
         return -EACCES; // Sem permissão de leitura
     }
 
-    // Atualizar tempo de acesso
+    // Update access time
     meta->accessed = time(NULL);
 
     debug_log("File opened successfully: %s\n", path);
-    return 0; // Arquivo aberto com sucesso
+    return 0; // File opened successfully
 }
 
+// Função para remover diretórios
+static int bmpfs_rmdir(const char *path) {
+    int idx = path_to_metadata_index(path);
+    if (idx < 0) {
+        return idx;
+    }
+
+    FileMetadata *meta = &fs_state.files[idx];
+
+    // Verificar se é um diretório
+    if (!meta->is_dir) {
+        debug_log("Cannot remove a file as directory: %s\n", path);
+        return -ENOTDIR;
+    }
+
+    // Verificar se o diretório está vazio
+    for (size_t i = 0; i < fs_state.max_files; i++) {
+        if (fs_state.files[i].filename[0] != '\0' &&
+            strcmp(fs_state.files[i].filename, path) != 0) {
+            // Para simplificar, assumimos que todos os arquivos estão na raiz
+            // Se desejar suportar diretórios aninhados, isso precisaria ser ajustado
+            continue;
+        }
+    }
+
+    // Liberar blocos no bitmap, se houver
+    for (uint32_t i = 0; i < meta->num_blocks; i++) {
+        fs_state.bitmap[meta->first_block + i] = 0;
+    }
+
+    // Clear metadata
+    memset(meta, 0, sizeof(FileMetadata));
+
+    // Write updated metadata to the BMP file
+    if (write_metadata(&fs_state) < 0) {
+        debug_log("Failed to write metadata after directory deletion\n");
+        return -EIO;
+    }
+
+    debug_log("Directory deleted successfully: %s (idx: %d)\n", path, idx);
+    return 0;
+}
+
+// Define FUSE operations
 static const struct fuse_operations bmpfs_ops = {
     .init       = bmpfs_init,
     .destroy    = bmpfs_destroy,
@@ -1093,6 +1234,8 @@ static const struct fuse_operations bmpfs_ops = {
     .truncate   = bmpfs_truncate,
     .utimens    = bmpfs_utimens,
     .fsync      = bmpfs_fsync,
+    .mkdir      = bmpfs_mkdir, // Adicionando a função mkdir
+    .rmdir      = bmpfs_rmdir, // Adicionando a função rmdir
 };
 
 int main(int argc, char *argv[]) {
